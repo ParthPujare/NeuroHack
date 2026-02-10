@@ -13,8 +13,18 @@ st.caption("powered by Gemini 1.5 Flash, ChromaDB & Neo4j")
 # Session State
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "user_id" not in st.session_state:
-    st.session_state.user_id = f"user_{uuid.uuid4().hex[:8]}"
+if "user_id_input" not in st.session_state:
+    st.session_state.user_id_input = "Adi" # Default for stable memory
+
+with st.sidebar:
+    st.header("Memory Settings")
+    st.session_state.user_id_input = st.text_input("Memory User ID", value=st.session_state.user_id_input)
+    st.caption(f"Current internal ID: {st.session_state.user_id_input}")
+    if st.button("Clear Frontend Chat"):
+        st.session_state.messages = []
+        st.rerun()
+
+st.session_state.user_id = st.session_state.user_id_input
 
 # Display Chat History
 for message in st.session_state.messages:

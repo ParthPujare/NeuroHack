@@ -65,27 +65,55 @@ class MemoryManager:
             print("DEBUG: Neo4j driver not available, skipping node creation")
             return
         
-        # Ensure 'id' is in properties
+        # Ensure 'id' is in properties - only generate UUID if not provided
         if 'id' not in properties:
             import uuid
             properties['id'] = str(uuid.uuid4())
+            print(f"DEBUG: Generated UUID for {label}: {properties['id']}")
+        
+        # Temporal Metadata Defaults
+        import time
+        if 'valid_from' not in properties:
+            properties['valid_from'] = time.time()
+        if 'status' not in properties:
+            properties['status'] = 'active'
         
         def _create_node(tx, label, props):
+            # Use label-specific MERGE with ID
             query = f"MERGE (n:{label} {{id: $id}}) SET n += $props RETURN n"
             print(f"DEBUG: Executing query: {query} with id={props['id']}")
             result = tx.run(query, id=props['id'], props=props)
             record = result.single()
-            print(f"DEBUG: Node creation result: {record}")
             return record
         
         try:
             with self.driver.session() as session:
                 result = session.execute_write(_create_node, label, properties)
-                print(f"DEBUG: Successfully created node: {label} with id={properties['id']}")
+                print(f"DEBUG: Successfully updated/created node: {label} with id={properties['id']}")
         except Exception as e:
             print(f"ERROR: Failed to create node {label}: {e}")
-            import traceback
-            traceback.print_exc()
+
+    def supersede_node(self, old_node_id, new_node_id, label):
+        """Marks old node as obsolete and links new node to it with SUPERSEDES."""
+        if not self.driver: return
+        
+        import time
+        now = time.time()
+        
+        query = f"""
+        MATCH (old:{label} {{id: $old_id}})
+        MATCH (new:{label} {{id: $new_id}})
+        SET old.status = 'obsolete', old.valid_until = $now
+        MERGE (new)-[r:SUPERSEDES]->(old)
+        SET r.timestamp = $now
+        RETURN new, old
+        """
+        try:
+            with self.driver.session() as session:
+                session.run(query, old_id=old_node_id, new_id=new_node_id, now=now)
+                print(f"DEBUG: Node {new_node_id} now SUPERSEDES {old_node_id}")
+        except Exception as e:
+            print(f"ERROR in supersede_node: {e}")
 
     def create_relationship(self, source_label, source_id, rel_type, target_label, target_id, rel_props=None):
         """Creates a relationship between two nodes."""

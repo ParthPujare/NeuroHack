@@ -10,28 +10,74 @@ class Pipeline:
         self.memory_manager = memory_manager
         
         # Initialize Dual-LLM System
-        print("Initializing Dual-LLM System...")
-        self.local_llm = LLMFactory.get_provider("llama_local")
+        print("Initializing LLM System...")
+        
+        # Try to load local LLM, fall back to Gemini if unavailable
+        try:
+            self.local_llm = LLMFactory.get_provider("llama_local")
+            self.use_local_llm = True
+            print("✓ Local LLM (Llama) loaded successfully")
+        except (ImportError, Exception) as e:
+            print(f"⚠ Local LLM unavailable ({e}). Using Gemini for all operations.")
+            self.local_llm = None
+            self.use_local_llm = False
+        
         self.remote_llm = LLMFactory.get_provider("gemini")
-        print("Dual-LLM System Ready.")
+        print("✓ Remote LLM (Gemini) ready")
+        print("LLM System Ready.")
 
     async def process_turn(self, user_message: str, user_id: str) -> ChatResponse:
         logs = {}
         try:
-            # --- Step 1: Planner (Intent Extraction) - Local LLM ---
+            # Determine which LLM to use
+            llm_to_use = self.local_llm if self.use_local_llm else self.remote_llm
+
+            # --- Step 0: Temporal Context Planner ---
+            temporal_planner_prompt = f"""
+            Analyze the user message for any overrides or updates to previous preferences or schedules.
+            User Message: "{user_message}"
+            
+            Task:
+            1. Is the user correcting or updating something they might have said before? (e.g., "instead", "wait", "actually", "change to")
+            2. Identify the target entity type (User, Preference, Event).
+            
+            Output JSON:
+            {{
+                "is_override": boolean,
+                "target_node_label": "User|Preference|Event|null",
+                "conflict_summary": "string|null"
+            }}
+            """
+            temporal_check = await asyncio.to_thread(llm_to_use.generate_json, temporal_planner_prompt)
+            logs['step0_temporal_check'] = temporal_check
+            if temporal_check.get('is_override'):
+                print(f"DEBUG: Temporal Conflict Detected: {temporal_check['conflict_summary']}")
+
+            # --- Step 1: Planner (Intent Extraction) ---
             planner_prompt = f"""
             Analyze the following user message: "{user_message}"
             Identify core entities and generate search terms for a vector database and a Cypher query for a graph database (Neo4j).
-            The user ID is '{user_id}'.
             
-            Output a JSON object with:
-            - entities: list of strings
-            - search_terms: list of strings for semantic search
-            - cypher_query: string (optional, null if no graph lookup needed). Use the label 'User' for the user.
+            Context:
+            - User ID: '{user_id}'
+            - Override Detected: {temporal_check.get('is_override')}
+            - Target: {temporal_check.get('target_node_label')}
+            
+            Schemas:
+            - User {{id, name}}
+            - Preference {{name, value}}
+            - Event {{description, status}}
+            
+            Instructions:
+            1. Query for ACTIVE nodes only (status: 'active').
+            2. If an override was detected, prioritize searching for the existing version of that preference.
+            
+            Output JSON with search_terms (list) and cypher_query (string).
+            Use MATCH (u:User {{id: '{user_id}'}})-[:HAS_PREFERENCE]->(p:Preference {{status: 'active'}}) etc.
             """
             
-            # Use Local LLM for planning
-            planner_response = await asyncio.to_thread(self.local_llm.generate_json, planner_prompt)
+            planner_response = await asyncio.to_thread(llm_to_use.generate_json, planner_prompt)
+            print(f"DEBUG: Raw Planner Response: {json.dumps(planner_response, indent=2)}")
             logs['step1_planner'] = planner_response
             
             # --- Step 2: Retrieval ---
@@ -46,44 +92,82 @@ class Pipeline:
             # Graph Search (Neo4j)
             graph_results = []
             if planner_response.get('cypher_query'):
+                cypher = planner_response['cypher_query']
+                # Safety check: Ensure the query actually mentions the user if it's meant to be a user lookup
+                print(f"DEBUG: Generated Cypher Query: {cypher}")
                 try:
-                    graph_results = self.memory_manager.run_graph_query(planner_response['cypher_query'])
+                    graph_results = self.memory_manager.run_graph_query(cypher)
+                    print(f"DEBUG: Graph Results: {graph_results}")
                 except Exception as e:
                     print(f"Graph query failed: {e}")
                     logs['step2_graph_error'] = str(e)
+            else:
+                print("DEBUG: No Cypher query generated by planner.")
 
             logs['step2_retrieval'] = {
                 'vector': vector_results,
                 'graph': graph_results
             }
 
-            # --- Step 3: Reconciliation (Logic) ---
-            context_str = f"Semantic Memory:\n{vector_results}\n\nStructured Memory:\n{graph_results}"
+            # --- Step 3: Reasoning & De-confliction ---
+            # Separate active truths from obsolete history if present in results
+            active_facts = [res for res in graph_results if res.get('status') != 'obsolete']
+            obsolete_history = [res for res in graph_results if res.get('status') == 'obsolete']
+            
+            context_str = f"""
+            === ACTIVE TRUTH (Current Preferences) ===
+            {active_facts}
+            {vector_results}
+            
+            === OBSOLETE HISTORY (Superseded) ===
+            {obsolete_history}
+            """
             logs['step3_reconciliation'] = context_str
 
-            # --- Step 4: Synthesis - Local LLM ---
-            synthesis_prompt = f"""
-            Synthesize the following memory context into a coherent narrative relevant to the user's current message: "{user_message}"
-            
-            Context:
-            {context_str}
-            
-            If the context is empty or irrelevant, simply state "No relevant past context found."
-            """
-            synthesis_response = await asyncio.to_thread(self.local_llm.generate_text, synthesis_prompt)
-            logs['step4_synthesis'] = synthesis_response
+            if self.use_local_llm:
+                # --- Step 4: Synthesis ---
+                synthesis_prompt = f"""
+                Analyze the memory context and the user message: "{user_message}"
+                
+                Memory Snapshot:
+                {context_str}
+                
+                Task:
+                1. Identify if the user is changing their mind (active vs obsolete).
+                2. Consolidate only the most relevant and RECENT facts into a 'Clean Truth' summary.
+                3. Mention the history only if the user specifically asks "What did I say before?".
+                """
+                synthesis_response = await asyncio.to_thread(self.local_llm.generate_text, synthesis_prompt)
+                logs['step4_synthesis'] = synthesis_response
+                response_input = synthesis_response
+            else:
+                # Optimized Remote Path
+                print("DEBUG: Optimizing - Reasoning directly in final response...")
+                response_prompt = f"""
+                You are a Reasoning AI Assistant with 'Temporal Awareness'.
+                User Message: "{user_message}"
+                
+                Memory Context:
+                {context_str}
+                
+                Instructions:
+                1. Use the ACTIVE TRUTH for your answer.
+                2. If the user is updating a fact (e.g. changing a time), acknowledge the update gracefully.
+                3. Do not mention 'obsolete' facts as current truth.
+                """
+                final_response = await asyncio.to_thread(self.remote_llm.generate_text, response_prompt)
+                synthesis_response = "Synthesized 'Clean Truth' context used for response."
+                logs['step4_synthesis'] = synthesis_response
+                response_input = None
 
-            # --- Step 5: Response - Remote LLM (Gemini) ---
-            response_prompt = f"""
-            You are a helpful AI assistant.
-            User Message: "{user_message}"
-            
-            relevant Context (from memory):
-            {synthesis_response}
-            
-            Generate a natural, helpful response.
-            """
-            final_response = await asyncio.to_thread(self.remote_llm.generate_text, response_prompt)
+            if response_input:
+                response_prompt = f"""
+                User Message: "{user_message}"
+                Reasoned Context: {response_input}
+                
+                Generate a natural, helpful response.
+                """
+                final_response = await asyncio.to_thread(self.remote_llm.generate_text, response_prompt)
             
             return ChatResponse(
                 response=final_response,
@@ -126,24 +210,46 @@ class Pipeline:
         """
         
         try:
-            updates = await asyncio.to_thread(self.local_llm.generate_json, extraction_prompt)
+            llm_to_use = self.local_llm if self.use_local_llm else self.remote_llm
+            updates = await asyncio.to_thread(llm_to_use.generate_json, extraction_prompt)
             print(f"DEBUG: Async Update JSON: {json.dumps(updates, indent=2)}")
             
             if updates.get('nodes'):
                 for node in updates['nodes']:
-                    print(f"DEBUG: Adding node: {node}")
-                    self.memory_manager.add_graph_node(node['label'], node['properties'])
+                    label = node['label']
+                    props = node.get('properties', {}).copy()
+                    if 'id' in node:
+                        props['id'] = node['id']
+                    
+                    # Memory Gardener Logic: Check for direct overlaps (e.g. same preference name)
+                    if label == 'Preference' and 'name' in props:
+                        # Find existing active preference with same name for this user
+                        check_query = f"""
+                        MATCH (u:User {{id: $uid}})-[:HAS_PREFERENCE]->(p:Preference {{name: $name, status: 'active'}})
+                        RETURN p.id as id
+                        """
+                        existing = self.memory_manager.run_graph_query(check_query, {"uid": user_id, "name": props['name']})
+                        
+                        # Add new node
+                        self.memory_manager.add_graph_node(label, props)
+                        
+                        # Apply SUPERSEDES if match found
+                        if existing:
+                            old_id = existing[0]['id']
+                            if old_id != props.get('id'):
+                                self.memory_manager.supersede_node(old_id, props['id'], 'Preference')
+                    else:
+                        self.memory_manager.add_graph_node(label, props)
             
             if updates.get('relationships'):
                 for rel in updates['relationships']:
-                    print(f"DEBUG: Adding rel: {rel}")
                     self.memory_manager.create_relationship(
                         rel['source_label'], rel['source_id'],
                         rel['type'],
                         rel['target_label'], rel['target_id'],
                         rel.get('properties', {})
                     )
-            print("Async update completed.")
+            print("Memory Gardener: Graph updated and de-conflicted.")
         except Exception as e:
             print(f"Async update failed: {e}")
             import traceback
