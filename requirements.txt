@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+streamlit
+chromadb
+neo4j
+google-generativeai
+python-dotenv
+pydantic
+tenacity

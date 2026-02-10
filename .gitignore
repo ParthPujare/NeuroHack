@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+
+# Models
+models/*.gguf
+
+# Vector DB
+chroma_db/
+
+# Secrets
+.env
+.env.example
