@@ -32,6 +32,23 @@ class MemoryManager:
         if self.driver:
             self.driver.close()
 
+    def ensure_user_exists(self, user_id):
+        """Ensures a User node exists in the graph database."""
+        if not self.driver:
+            return
+        
+        query = """
+        MERGE (u:User {id: $user_id})
+        ON CREATE SET u.created_at = timestamp()
+        RETURN u
+        """
+        try:
+            with self.driver.session() as session:
+                session.run(query, user_id=user_id)
+                print(f"DEBUG: User node ensured for {user_id}")
+        except Exception as e:
+            print(f"ERROR: Failed to ensure user exists: {e}")
+
     def add_vector_memory(self, turn_id, text, metadata=None):
         """Adds a conversation turn to ChromaDB."""
         if metadata is None:

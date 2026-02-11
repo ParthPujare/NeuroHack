@@ -3,7 +3,8 @@ uvicorn
 streamlit
 chromadb
 neo4j
-google-generativeai
+google-genai
 python-dotenv
 pydantic
 tenacity
+groq
