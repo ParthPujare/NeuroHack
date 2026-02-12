@@ -1,15 +1,47 @@
 "use client"
 
-import { useState, useRef, useEffect } from "react"
+import { useState, useRef, useEffect, useMemo } from "react"
 import { motion, AnimatePresence } from "framer-motion"
-import { Send, Paperclip, X, Home, Loader2, ArrowUp } from "lucide-react"
+import { Send, Paperclip, X, Home, Loader2, ArrowUp, Copy, Menu, Plus, Pencil, SquarePen } from "lucide-react"
 import { cn } from "@/lib/utils"
-// import { Sidebar } from "./Sidebar" // Assuming standard export, but code used named export
-import { Sidebar } from "@/components/Sidebar"
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
+import { atomDark } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import { Sidebar, SekhmetLogo } from "@/components/Sidebar"
 import { getConversations, getMessages, createConversation, deleteConversation, updateConversationTitle } from "@/lib/api"
 
 import { ThinkingProcess } from "./ThinkingProcess"
 import { GroundingFiles } from "./GroundingFiles"
+
+// Gemini-style animated text: words fade in chunk by chunk
+function AnimatedMarkdown({ content, components, remarkPlugins }: { content: string, components: any, remarkPlugins: any }) {
+    const [visibleChars, setVisibleChars] = useState(0)
+    const totalChars = content.length
+
+    useEffect(() => {
+        if (visibleChars >= totalChars) return
+        // Reveal ~15 chars per frame for a fast but visible wave effect
+        const timer = setTimeout(() => {
+            setVisibleChars(prev => Math.min(prev + 15, totalChars))
+        }, 8)
+        return () => clearTimeout(timer)
+    }, [visibleChars, totalChars])
+
+    const visibleContent = content.slice(0, visibleChars)
+    const isDone = visibleChars >= totalChars
+
+    return (
+        <div className={cn("transition-opacity", isDone ? "" : "")}>
+            <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+                {visibleContent}
+            </ReactMarkdown>
+            {!isDone && (
+                <span className="inline-block w-1.5 h-4 bg-blue-400/80 animate-pulse rounded-full ml-0.5 -mb-0.5" />
+            )}
+        </div>
+    )
+}
 
 interface Message {
     role: "user" | "assistant"
@@ -17,6 +49,7 @@ interface Message {
     files?: number
     details?: any
     grounding_metadata?: any
+    isNew?: boolean
 }
 
 interface Conversation {
@@ -29,9 +62,10 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
     const [messages, setMessages] = useState<Message[]>([])
     const [input, setInput] = useState("")
     const [isLoading, setIsLoading] = useState(false)
+    const [isLoadingMessages, setIsLoadingMessages] = useState(false)
     const [attachedFiles, setAttachedFiles] = useState<File[]>([])
     const [userId, setUserId] = useState<string>("Guest")
-    const [sidebarOpen, setSidebarOpen] = useState(true)
+    const [sidebarOpen, setSidebarOpen] = useState(false)
 
     // History State
     const [conversations, setConversations] = useState<Conversation[]>([])
@@ -75,37 +109,6 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
         loadHistory()
     }, [userId])
 
-    // Poll for title updates
-    useEffect(() => {
-        if (!currentConversationId || !userId) return;
-
-        const currentConv = conversations.find(c => c.id === currentConversationId);
-        if (currentConv?.title === "New Chat") {
-            const interval = setInterval(async () => {
-                try {
-                    // Refresh just this conversation's title? Or all...
-                    // Efficient way: fetch all history for now
-                    const updatedConvs = await getConversations(userId);
-                    setConversations(updatedConvs);
-
-                    const updated = updatedConvs.find((c: any) => c.id === currentConversationId);
-                    if (updated && updated.title !== "New Chat") {
-                        clearInterval(interval);
-                    }
-                } catch (e) {
-                    console.error("Polling error:", e);
-                }
-            }, 3000); // Check every 3s
-
-            // Stop polling after 30s to save resources
-            const timeout = setTimeout(() => clearInterval(interval), 30000);
-
-            return () => {
-                clearInterval(interval);
-                clearTimeout(timeout);
-            }
-        }
-    }, [currentConversationId, conversations, userId])
 
 
     // Scroll to bottom
@@ -125,19 +128,21 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
         if (id === currentConversationId) return;
 
         setCurrentConversationId(id)
-        setIsLoading(true)
+        setMessages([])
+        setIsLoadingMessages(true)
         try {
             const data = await getMessages(id)
             setMessages(data.map((m: any) => ({
                 role: m.role,
                 content: m.content,
                 details: m.metadata?.step_logs,
-                grounding_metadata: m.metadata?.grounding_metadata
+                grounding_metadata: m.metadata?.grounding_metadata,
+                isNew: false
             })))
         } catch (e) {
             console.error("Failed to load messages:", e)
         } finally {
-            setIsLoading(false)
+            setIsLoadingMessages(false)
         }
     }
 
@@ -186,14 +191,16 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
         })
 
         try {
-            // Ensure conversation exists
+            // Ensure conversation exists (create it but DON'T add to sidebar yet)
             let activeConvId = currentConversationId;
+            let isNewConversation = false;
             if (!activeConvId) {
                 try {
                     const newConv = await createConversation(userId, "New Chat")
                     activeConvId = newConv.id;
                     setCurrentConversationId(activeConvId)
-                    setConversations(prev => [newConv, ...prev])
+                    isNewConversation = true
+                    // Don't add to conversations list yet — wait for response with title
                 } catch (e) {
                     console.error("Failed to create conversation:", e)
                 }
@@ -224,12 +231,23 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
                     role: "assistant",
                     content: data.response,
                     details: data.step_logs,
-                    grounding_metadata: data.grounding_metadata
+                    grounding_metadata: data.grounding_metadata,
+                    isNew: true
                 }])
 
-                if (activeConvId) {
-                    // Quietly refresh history to update titles/timestamps
-                    getConversations(userId).then(setConversations).catch(console.error)
+                // Add new conversation to sidebar only now (with proper title)
+                if (isNewConversation && activeConvId) {
+                    const title = data.title || "New Chat"
+                    setConversations(prev => [{
+                        id: activeConvId!,
+                        title,
+                        updated_at: new Date().toISOString()
+                    }, ...prev])
+                } else if (data.title && activeConvId) {
+                    // Update existing conversation title
+                    setConversations(prev => prev.map(c =>
+                        c.id === activeConvId ? { ...c, title: data.title } : c
+                    ))
                 }
             }
         } catch (error) {
@@ -258,12 +276,28 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
             {/* Main Chat Area */}
             <div className={cn(
                 "flex-1 flex flex-col relative min-w-0 bg-[#050505] transition-all duration-300",
-                sidebarOpen ? "md:ml-[260px]" : "md:ml-0"
+                sidebarOpen ? "md:ml-[260px]" : "md:ml-[60px]"
             )}>
-                {/* Header for Mobile */}
-                <div className="md:hidden p-4 glass-dark border-b border-white/5 flex items-center justify-between">
-                    <span className="font-bold text-white">Sekhmet</span>
-                    <button onClick={onBack} className="p-2 glass rounded-lg"><Home className="w-4 h-4" /></button>
+                {/* Mobile Header — hamburger + branding + new chat */}
+                {/* Mobile Header — hamburger + branding + new chat */}
+                <div className="relative md:hidden px-4 py-3 border-b border-white/[0.06] flex items-center justify-between bg-[#0a0a0a]/80 backdrop-blur-xl sticky top-0 z-30">
+                    <button
+                        onClick={() => setSidebarOpen(true)}
+                        className="p-2 -ml-2 rounded-lg hover:bg-white/[0.06] text-white/60 hover:text-white transition-all"
+                    >
+                        <Menu className="w-5 h-5" />
+                    </button>
+
+                    <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none">
+                        <span className="font-bold text-white tracking-widest uppercase text-xs">Sekhmet</span>
+                    </div>
+
+                    <button
+                        onClick={handleNewChat}
+                        className="p-2 -mr-2 rounded-lg hover:bg-white/[0.06] text-white/60 hover:text-white transition-all"
+                    >
+                        <SquarePen className="w-5 h-5" />
+                    </button>
                 </div>
 
                 {/* Messages Container */}
@@ -272,7 +306,7 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
                     className="flex-1 overflow-y-auto px-4 md:px-8 pt-10 pb-40 flex flex-col items-center custom-scrollbar"
                 >
                     <div className="w-full max-w-3xl space-y-10">
-                        {messages.length === 0 && (
+                        {messages.length === 0 && !isLoadingMessages && (
                             <motion.div
                                 initial={{ opacity: 0 }}
                                 animate={{ opacity: 1 }}
@@ -288,6 +322,13 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
                             </motion.div>
                         )}
 
+                        {isLoadingMessages && (
+                            <div className="h-[70vh] flex flex-col items-center justify-center">
+                                <Loader2 className="w-6 h-6 text-white/30 animate-spin mb-3" />
+                                <span className="text-xs text-white/20 uppercase tracking-[0.3em] font-bold">Loading messages...</span>
+                            </div>
+                        )}
+
                         {messages.map((m, i) => (
                             <motion.div
                                 initial={{ opacity: 0, scale: 0.98 }}
@@ -301,10 +342,82 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
                                 <div className={cn(
                                     "p-5 rounded-2xl max-w-[90%] md:max-w-[80%] text-[15px] leading-relaxed break-words shadow-2xl",
                                     m.role === "user"
-                                        ? "bg-white text-black font-semibold rounded-tr-none"
-                                        : "glass border-white/10 text-white/90 rounded-tl-none backdrop-blur-3xl"
+                                        ? "bg-white text-black font-semibold rounded-tr-none text-left"
+                                        : "glass border-white/10 text-white/90 rounded-tl-none backdrop-blur-3xl text-left"
                                 )}>
-                                    {m.content}
+                                    {(() => {
+                                        const mdComponents = {
+                                            a: ({ node, ...props }: any) => <a {...props} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 underline" />,
+                                            code({ node, inline, className, children, ...props }: any) {
+                                                const match = /language-(\w+)/.exec(className || '')
+                                                const [copied, setCopied] = useState(false)
+
+                                                if (!inline && match) {
+                                                    const code = String(children).replace(/\n$/, '')
+
+                                                    const handleCopy = () => {
+                                                        navigator.clipboard.writeText(code)
+                                                        setCopied(true)
+                                                        setTimeout(() => setCopied(false), 2000)
+                                                    }
+
+                                                    return (
+                                                        <div className="relative group rounded-xl overflow-hidden my-4 border border-white/10 bg-[#1e1e1e]">
+                                                            <div className="flex items-center justify-between px-4 py-2 bg-white/5 border-b border-white/5">
+                                                                <span className="text-xs text-white/40 font-mono lower">{match[1]}</span>
+                                                                <button
+                                                                    onClick={handleCopy}
+                                                                    className="p-1.5 rounded-lg hover:bg-white/10 text-white/40 hover:text-white transition-colors"
+                                                                >
+                                                                    {copied ? (
+                                                                        <span className="text-emerald-400 text-xs font-medium">Copied!</span>
+                                                                    ) : (
+                                                                        <Copy className="w-3.5 h-3.5" />
+                                                                    )}
+                                                                </button>
+                                                            </div>
+                                                            <SyntaxHighlighter
+                                                                style={atomDark}
+                                                                language={match[1]}
+                                                                PreTag="div"
+                                                                customStyle={{
+                                                                    margin: 0,
+                                                                    padding: '1.5rem',
+                                                                    background: 'transparent',
+                                                                    fontSize: '0.875rem',
+                                                                    lineHeight: '1.7'
+                                                                }}
+                                                                wrapLongLines={true}
+                                                                {...props}
+                                                            >
+                                                                {code}
+                                                            </SyntaxHighlighter>
+                                                        </div>
+                                                    )
+                                                }
+                                                return (
+                                                    <code className={cn("bg-white/10 text-blue-300 rounded px-1.5 py-0.5 text-sm font-mono", className)} {...props}>
+                                                        {children}
+                                                    </code>
+                                                )
+                                            }
+                                        }
+
+                                        return (
+                                            <div className={cn(
+                                                "prose max-w-none prose-p:leading-relaxed prose-pre:p-0 prose-pre:bg-transparent prose-pre:border-none prose-code:before:content-none prose-code:after:content-none",
+                                                m.role === "user" ? "text-black prose-headings:text-black prose-p:text-black prose-strong:text-black prose-li:text-black" : "prose-invert text-white/90"
+                                            )}>
+                                                {m.role === "assistant" && m.isNew ? (
+                                                    <AnimatedMarkdown content={m.content} components={mdComponents} remarkPlugins={[remarkGfm]} />
+                                                ) : (
+                                                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                                                        {m.content}
+                                                    </ReactMarkdown>
+                                                )}
+                                            </div>
+                                        )
+                                    })()}
                                 </div>
 
                                 {m.files && (
@@ -368,36 +481,49 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
 
                         {/* Input Container */}
                         <div className="relative">
-                            <input
-                                type="text"
+                            <textarea
+                                ref={(el) => {
+                                    if (el) {
+                                        el.style.height = 'auto'
+                                        el.style.height = Math.min(el.scrollHeight, 200) + 'px'
+                                        el.style.overflowY = el.scrollHeight > 200 ? 'auto' : 'hidden'
+                                    }
+                                }}
+                                rows={1}
                                 value={input}
                                 onChange={(e) => setInput(e.target.value)}
-                                onKeyDown={(e) => e.key === 'Enter' && handleSend()}
+                                onKeyDown={(e) => {
+                                    if (e.key === 'Enter' && !e.shiftKey) {
+                                        e.preventDefault()
+                                        handleSend()
+                                    }
+                                }}
                                 placeholder={isLoading ? "Processing..." : "Message Sekhmet..."}
-                                className="w-full px-5 py-4 pr-24 bg-[#1a1a1a] border border-white/[0.08] rounded-2xl text-white text-[15px] placeholder:text-white/20 outline-none focus:border-white/20 transition-all"
+                                className="w-full px-5 py-4 pr-24 bg-[#1a1a1a] border border-white/[0.08] rounded-2xl text-white text-[15px] placeholder:text-white/20 outline-none focus:border-white/20 transition-all resize-none custom-scrollbar"
+                                style={{ minHeight: '56px', maxHeight: '200px', overflowY: 'hidden' }}
                             />
-                            <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1.5">
+                            <div className="absolute right-2 bottom-2 flex items-center gap-2">
                                 <button
                                     onClick={() => fileInputRef.current?.click()}
-                                    className="p-2 rounded-lg hover:bg-white/[0.06] text-white/25 hover:text-white/60 transition-all"
+                                    className="p-2.5 rounded-xl hover:bg-white/10 text-white/40 hover:text-white transition-colors"
                                     title="Attach file"
                                 >
-                                    <Paperclip className="w-4 h-4" />
+                                    <Paperclip className="w-5 h-5" strokeWidth={2} />
                                 </button>
                                 <button
                                     onClick={handleSend}
                                     disabled={!input.trim() && attachedFiles.length === 0}
                                     className={cn(
-                                        "p-2 rounded-lg transition-all",
+                                        "p-2.5 rounded-full transition-all shadow-lg shadow-white/5",
                                         input.trim() || attachedFiles.length > 0
-                                            ? "bg-white text-black hover:bg-white/90 active:scale-95"
-                                            : "bg-white/[0.06] text-white/20 cursor-not-allowed"
+                                            ? "bg-white text-black hover:scale-105 active:scale-95"
+                                            : "bg-white/10 text-white/20 cursor-not-allowed"
                                     )}
                                 >
                                     {isLoading ? (
-                                        <Loader2 className="w-4 h-4 animate-spin" />
+                                        <Loader2 className="w-5 h-5 animate-spin" />
                                     ) : (
-                                        <ArrowUp className="w-4 h-4" />
+                                        <ArrowUp className="w-5 h-5" strokeWidth={2.5} />
                                     )}
                                 </button>
                             </div>

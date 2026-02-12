@@ -126,7 +126,28 @@ class Pipeline:
             
             llm_to_use = self.fast_llm if self.fast_llm else self.remote_llm
 
-            # --- Step 0: Temporal Context Planner ---
+            # --- Step 0: Retrieve History if conversation_id exists ---
+            history_context = ""
+            if conversation_id:
+                async with await get_db_connection() as conn:
+                    # Fetch last 10 messages (excluding the one we just saved)
+                    rows = await conn.fetch('''
+                        SELECT role, content 
+                        FROM messages 
+                        WHERE conversation_id = $1 
+                        ORDER BY created_at DESC 
+                        LIMIT 10
+                    ''', conversation_id)
+                    # Reverse to getting chronological order
+                    messages = list(reversed([dict(row) for row in rows]))
+                    
+                    # Filter out the current message if it was already saved (it should be, but let's be safe)
+                    messages = [m for m in messages if m['content'] != user_message]
+                    
+                    if messages:
+                         history_context = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in messages])
+            
+            # --- Step 0.5: Temporal Context Planner ---
             temporal_planner_prompt = f"""
             Analyze the user message for any overrides or updates to previous preferences or schedules.
             User Message: "{user_message}"
@@ -159,10 +180,13 @@ class Pipeline:
             - Override Detected: {temporal_check.get('is_override')}
             - Target: {temporal_check.get('target_node_label')}
             
+            Recent Conversation History:
+            {history_context}
+            
             Instructions:
             1. **SEARCH POLICY**: 
-               - Set `needs_search` to `true` ONLY if the user asks for real-time data (weather, stocks, news) or very specific recent events not in your training data.
-               - Set `needs_search` to `false` for general knowledge (history, science, coding), opinions, or questions about the user's own data.
+               - Set `needs_search` to `true` ONLY if the user asks for real-time data (weather, stocks, news and other stuff) or very specific recent events or for information through internet sources.
+               - Set `needs_search` to `false` for general knowledge (history, science, coding), opinions, or questions about the user's own data for which you are sure that the net LLM would have data in training.
                - DO NOT search if the info might be in the long-term memory (Graph/Vector).
             
             2. **Graph/Vector Query**:
@@ -382,6 +406,9 @@ This information persists across ALL conversations and MUST influence your respo
                 
                 Memory Snapshot:
                 {context_str}
+
+                Recent Conversation History (Short Term Memory):
+                {history_context}
                 
                 OUTPUT RULES:
                 - Output ONLY a short bullet-point list of facts relevant to the user's current message and relevant preferences,facts.
@@ -415,6 +442,9 @@ This information persists across ALL conversations and MUST influence your respo
                 
                 Your Memory of This User:
                 {context_str}
+
+                Recent Conversation History:
+                {history_context}
                 
                 Relevant Semantic Context (Past Conversations):
                 {semantic_context if vector_results else "No relevant past conversations found."}
@@ -448,6 +478,9 @@ This information persists across ALL conversations and MUST influence your respo
                 
                 What you remember about this user:
                 {response_input}
+
+                Recent Conversation History:
+                {history_context}
                 
                 Instructions:
                 - Respond directly and helpfully to the user's message
@@ -492,6 +525,9 @@ This information persists across ALL conversations and MUST influence your respo
             
             # Save Assistant Message
             if conversation_id:
+                # Add grounding metadata to logs for persistence
+                if grounding_metadata:
+                    logs['grounding_metadata'] = grounding_metadata
                 await self._save_message_to_db(conversation_id, "assistant", final_response, logs)
 
             return ChatResponse(
@@ -514,8 +550,7 @@ This information persists across ALL conversations and MUST influence your respo
         """Step 6 implementation: Embed turn and update Neo4j using Local LLM."""
         print("Running async update...")
         
-        if conversation_id:
-            await self._generate_title_if_needed(conversation_id, user_message, assistant_response)
+        # Title generation is now handled inline in the /chat endpoint
 
         # Prevent memory pollution from error messages
         error_signatures = [

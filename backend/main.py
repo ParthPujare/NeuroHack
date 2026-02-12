@@ -54,7 +54,26 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
     # Process turn (Steps 1-5)
     response = await pipeline.process_turn(request.message, request.user_id, request.conversation_id)
     
-    # Schedule Async Update (Step 6)
+    # Generate title for new conversations (inline, not async polling)
+    if request.conversation_id:
+        try:
+            async with await get_db_connection() as conn:
+                row = await conn.fetchrow('SELECT title FROM conversations WHERE id = $1', request.conversation_id)
+                if row and row['title'] == "New Chat":
+                    import asyncio
+                    title_prompt = f"""Generate a short, concise title (max 6 words) for this chat conversation.
+User: "{request.message}"
+Assistant: "{response.response[:200]}"
+
+Output ONLY the title, nothing else. No quotes."""
+                    title = await asyncio.to_thread(pipeline.fast_llm.generate_text, title_prompt)
+                    title = title.strip().strip('"').strip("'")[:60]
+                    await conn.execute('UPDATE conversations SET title = $1 WHERE id = $2', title, request.conversation_id)
+                    response.title = title
+        except Exception as e:
+            print(f"Title generation failed (non-critical): {e}")
+    
+    # Schedule Async Update (Step 6) — memory only, no title generation
     background_tasks.add_task(
         pipeline.run_async_update, 
         request.message, 
@@ -90,12 +109,23 @@ async def get_messages(conversation_id: str):
     try:
         async with await get_db_connection() as conn:
             rows = await conn.fetch('''
-                SELECT role, content, created_at 
+                SELECT role, content, metadata, created_at 
                 FROM messages 
                 WHERE conversation_id = $1 
                 ORDER BY created_at ASC
             ''', conversation_id)
-            return [dict(row) for row in rows]
+            
+            # Parse metadata JSON strings back to dicts
+            result = []
+            for row in rows:
+                msg = dict(row)
+                if msg.get('metadata'):
+                    try:
+                        msg['metadata'] = json.loads(msg['metadata'])
+                    except:
+                        msg['metadata'] = {}
+                result.append(msg)
+            return result
     except RuntimeError:
         raise HTTPException(status_code=503, detail="Database is not available")
 

@@ -11,3 +11,4 @@ class ChatResponse(BaseModel):
     context_used: Optional[str] = None
     step_logs: Optional[Dict[str, Any]] = None
     grounding_metadata: Optional[Dict[str, Any]] = None
+    title: Optional[str] = None
