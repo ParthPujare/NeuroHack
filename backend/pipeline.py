@@ -4,6 +4,7 @@ import asyncio
 from backend.memory_manager import MemoryManager
 from backend.models import ChatResponse
 from backend.llm_factory import LLMFactory, LLMProvider
+from backend.hot_memory import HotMemory
 import difflib
 from difflib import SequenceMatcher
 
@@ -39,6 +40,10 @@ class Pipeline:
         
         self.remote_llm = LLMFactory.get_provider("gemini")
         print("✓ Remote LLM (Gemini) ready")
+        
+        # Initialize Hot Memory (Redis Layer)
+        self.hot_memory = HotMemory()
+        
         print("LLM System Ready.")
 
     def _deduplicate_results(self, results: list, threshold: float = 0.85) -> list:
@@ -65,6 +70,18 @@ class Pipeline:
     async def process_turn(self, user_message: str, user_id: str) -> ChatResponse:
         logs = {}
         try:
+            # --- START: HOT MEMORY FAST PATH ---
+            cached_response = self.hot_memory.check_cache(user_id, user_message)
+            if cached_response:
+                # Reconstruct ChatResponse from cache
+                return ChatResponse(
+                    response=cached_response['response'],
+                    context_used="Retrieved from Hot Memory (Redis Cache)",
+                    step_logs=cached_response.get('step_logs', {}),
+                    grounding_metadata=cached_response.get('grounding_metadata')
+                )
+            # --- END: HOT MEMORY FAST PATH ---
+
             # Determine which LLM to use
             # If force_local was true and loaded, use it. Else use Groq (fast_llm).
             # If fast_llm failed to load (unlikely for Groq unless API key missing), fallback to remote.
@@ -126,12 +143,15 @@ class Pipeline:
             OPTIONAL MATCH (u)-[:HAS_FACT]->(f:Fact {{status: 'active'}})
             RETURN p, c, f
             """
-            
-            planner_response = await asyncio.to_thread(llm_to_use.generate_json, planner_prompt)
+            print(f"Step 1: Planning with {self.fast_llm.provider_name}...")
+            planner_response = await asyncio.to_thread(self.fast_llm.generate_json, planner_prompt)
             print(f"DEBUG: Raw Planner Response: {json.dumps(planner_response, indent=2)}")
-            logs['step1_planner'] = planner_response
-            logs['step1_planner']['model'] = llm_to_use.provider_name
+            logs['step1_planner'] = {**planner_response, "model": self.fast_llm.provider_name}
             logs['step1_planner']['prompt'] = planner_prompt
+            
+            # --- START: TREND TRACKING ---
+            self.hot_memory.track_trends(user_id, planner_response.get('search_terms', []))
+            # --- END: TREND TRACKING ---
             
             # --- Step 2: Retrieval ---
             # Ensure User node exists first
@@ -361,6 +381,7 @@ This information persists across ALL conversations and MUST influence your respo
                 {semantic_context if vector_results else "No relevant past conversations found."}
                 
                 Instructions:
+                - Respond ONLY in English.
                 - Respond naturally and helpfully to the user's message
                 - Use your memory to personalize your response (e.g. if they prefer Rust, give code in Rust)
                 - If the user is updating a fact, acknowledge the update
@@ -391,6 +412,7 @@ This information persists across ALL conversations and MUST influence your respo
                 {response_input}
                 
                 Instructions:
+                - Respond ONLY in English.
                 - Respond directly and helpfully to the user's message
                 - Use what you remember to personalize your response (e.g. if they prefer Rust, write code in Rust without being asked)
                 - Do NOT explain your reasoning or analysis process
@@ -431,6 +453,15 @@ This information persists across ALL conversations and MUST influence your respo
                         response_prompt
                     )
             
+            
+            # --- START: CACHE RESULT ---
+            self.hot_memory.save_to_cache(user_id, user_message, {
+                "response": final_response,
+                "step_logs": logs,
+                "grounding_metadata": grounding_metadata
+            })
+            # --- END: CACHE RESULT ---
+
             return ChatResponse(
                 response=final_response,
                 context_used=synthesis_response,
