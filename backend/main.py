@@ -37,7 +37,8 @@ async def chat_endpoint(request: ChatRequest, background_tasks: BackgroundTasks)
         pipeline.run_async_update, 
         request.message, 
         response.response, 
-        request.user_id
+        request.user_id,
+        response.step_logs.get('step2_retrieval') if response and response.step_logs else None
     )
     
     return response
