@@ -6,6 +6,7 @@ from backend.models import ChatResponse
 from backend.llm_factory import LLMFactory, LLMProvider
 import difflib
 from difflib import SequenceMatcher
+from backend.database import get_db_connection
 
 class Pipeline:
     def __init__(self, memory_manager: MemoryManager):
@@ -62,7 +63,61 @@ class Pipeline:
         
         return unique_results
 
-    async def process_turn(self, user_message: str, user_id: str) -> ChatResponse:
+    async def _save_message_to_db(self, conversation_id: str, role: str, content: str, metadata: dict = None):
+        if not conversation_id:
+            return
+        async with await get_db_connection() as conn:
+            try:
+                await conn.execute('''
+                    INSERT INTO messages (conversation_id, role, content, metadata)
+                    VALUES ($1, $2, $3, $4)
+                ''', conversation_id, role, content, json.dumps(metadata) if metadata else None)
+                
+                # Update conversation updated_at
+                await conn.execute('''
+                    UPDATE conversations SET updated_at = NOW() WHERE id = $1
+                ''', conversation_id)
+            except Exception as e:
+                print(f"Failed to save message to DB: {e}")
+
+    async def _generate_title_if_needed(self, conversation_id: str, user_message: str, assistant_response: str):
+        if not conversation_id:
+            print("DEBUG: No conversation_id provided for title generation.")
+            return
+        
+        print(f"DEBUG: Checking title generation for {conversation_id}...")
+        async with await get_db_connection() as conn:
+            try:
+                # Check current title
+                row = await conn.fetchrow('SELECT title FROM conversations WHERE id = $1', conversation_id)
+                if not row:
+                    print(f"DEBUG: Conversation {conversation_id} not found.")
+                    return
+                
+                if row['title'] != "New Chat":
+                    print(f"DEBUG: Conversation already has title: '{row['title']}'. Skipping generation.")
+                    return
+                
+                print("DEBUG: Generating new title...")
+                # Generate title using Groq
+                prompt = f"""
+                Generate a short, concise title (max 6 words) for this chat conversation based on the first exchange.
+                User: "{user_message}"
+                Assistant: "{assistant_response}"
+                
+                Title:
+                """
+                title = await asyncio.to_thread(self.fast_llm.generate_text, prompt)
+                title = title.strip().strip('"')
+                
+                await conn.execute('UPDATE conversations SET title = $1 WHERE id = $2', title, conversation_id)
+                print(f"DEBUG: Updated conversation title to: {title}")
+            except Exception as e:
+                print(f"Failed to generate title: {e}")
+
+    async def process_turn(self, user_message: str, user_id: str, conversation_id: str = None) -> ChatResponse:
+        if conversation_id:
+            await self._save_message_to_db(conversation_id, "user", user_message)
         logs = {}
         try:
             # Determine which LLM to use
@@ -97,28 +152,32 @@ class Pipeline:
             # --- Step 1: Planner (Intent Extraction) ---
             planner_prompt = f"""
             Analyze the following user message: "{user_message}"
-            Identify core entities and generate search terms for a vector database and a Cypher query for a graph database (Neo4j).
+            Identify core entities and decide if external search is TRULY needed.
             
             Context:
             - User ID: '{user_id}'
             - Override Detected: {temporal_check.get('is_override')}
             - Target: {temporal_check.get('target_node_label')}
             
-            Schemas:
-            - User {{id, name}}
-            - Preference {{name, value, status}}
-            - Fact {{description, value, status}}
-            - Entity {{name, type, status}}
-            - Constraint {{name, description, status}}
-            - Commitment {{description, due_date, status}}
-            - Instruction {{description, priority, status}}
-            
             Instructions:
-            1. Query for ACTIVE nodes only (status: 'active').
-            2. If an override was detected, prioritize searching for the existing version of that preference/entity.
-            3. Retrieve ALL relevant constraints, preferences, and facts for the user.
+            1. **SEARCH POLICY**: 
+               - Set `needs_search` to `true` ONLY if the user asks for real-time data (weather, stocks, news) or very specific recent events not in your training data.
+               - Set `needs_search` to `false` for general knowledge (history, science, coding), opinions, or questions about the user's own data.
+               - DO NOT search if the info might be in the long-term memory (Graph/Vector).
             
-            Output JSON with search_terms (list), cypher_query (string) and needs_search (boolean).
+            2. **Graph/Vector Query**:
+               - Always generate `search_terms` for the vector DB (semantic memory).
+               - Always generate a `cypher_query` for the graph DB.
+               - Query for ACTIVE nodes only (status: 'active').
+            
+            Output JSON:
+            {{
+                "search_terms": ["term1", "term2"], 
+                "cypher_query": "MATCH ... RETURN ...", 
+                "needs_search": boolean,
+                "reasoning": "why search is needed or not"
+            }}
+            
             Example Query: 
             MATCH (u:User {{id: '{user_id}'}})
             OPTIONAL MATCH (u)-[:HAS_PREFERENCE]->(p:Preference {{status: 'active'}})
@@ -431,6 +490,10 @@ This information persists across ALL conversations and MUST influence your respo
                         response_prompt
                     )
             
+            # Save Assistant Message
+            if conversation_id:
+                await self._save_message_to_db(conversation_id, "assistant", final_response, logs)
+
             return ChatResponse(
                 response=final_response,
                 context_used=synthesis_response,
@@ -447,9 +510,12 @@ This information persists across ALL conversations and MUST influence your respo
                 step_logs={"error": str(e), "partial_logs": logs}
             )
 
-    async def run_async_update(self, user_message: str, assistant_response: str, user_id: str, retrieved_context: dict = None):
+    async def run_async_update(self, user_message: str, assistant_response: str, user_id: str, retrieved_context: dict = None, conversation_id: str = None):
         """Step 6 implementation: Embed turn and update Neo4j using Local LLM."""
         print("Running async update...")
+        
+        if conversation_id:
+            await self._generate_title_if_needed(conversation_id, user_message, assistant_response)
 
         # Prevent memory pollution from error messages
         error_signatures = [

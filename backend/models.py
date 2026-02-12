@@ -4,6 +4,7 @@ from typing import List, Optional, Dict, Any
 class ChatRequest(BaseModel):
     message: str
     user_id: str = "user_1"
+    conversation_id: Optional[str] = None
 
 class ChatResponse(BaseModel):
     response: str

@@ -1,12 +1,28 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import Hero from "@/components/Hero"
 import ChatInterface from "@/components/ChatInterface"
 import { AnimatePresence, motion } from "framer-motion"
 
 export default function Home() {
-  const [view, setView] = useState<"landing" | "chat">("landing")
+  const [view, setView] = useState<"landing" | "chat" | null>(null)
+
+  // Check localStorage on mount
+  useEffect(() => {
+    const hasStarted = localStorage.getItem("sekhmet_started")
+    setView(hasStarted === "true" ? "chat" : "landing")
+  }, [])
+
+  const handleStart = () => {
+    localStorage.setItem("sekhmet_started", "true")
+    setView("chat")
+  }
+
+  // Don't render until we know which view to show (avoids flash)
+  if (view === null) {
+    return <main className="min-h-screen bg-[#050505]" />
+  }
 
   return (
     <main className="min-h-screen bg-[#050505]">
@@ -19,7 +35,7 @@ export default function Home() {
             exit={{ opacity: 0, scale: 0.98, filter: "blur(10px)" }}
             transition={{ duration: 0.5 }}
           >
-            <Hero onStart={() => setView("chat")} />
+            <Hero onStart={handleStart} />
           </motion.div>
         ) : (
           <motion.div

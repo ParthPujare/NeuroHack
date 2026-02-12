@@ -2,14 +2,27 @@
 
 import { useState, useRef, useEffect } from "react"
 import { motion, AnimatePresence } from "framer-motion"
-import { Send, Plus, Paperclip, X, Trash2, Home, Search, Loader2 } from "lucide-react"
+import { Send, Paperclip, X, Home, Loader2, ArrowUp } from "lucide-react"
 import { cn } from "@/lib/utils"
+// import { Sidebar } from "./Sidebar" // Assuming standard export, but code used named export
+import { Sidebar } from "@/components/Sidebar"
+import { getConversations, getMessages, createConversation, deleteConversation, updateConversationTitle } from "@/lib/api"
+
+import { ThinkingProcess } from "./ThinkingProcess"
+import { GroundingFiles } from "./GroundingFiles"
 
 interface Message {
     role: "user" | "assistant"
     content: string
     files?: number
     details?: any
+    grounding_metadata?: any
+}
+
+interface Conversation {
+    id: string
+    title: string
+    updated_at: string
 }
 
 export default function ChatInterface({ onBack }: { onBack: () => void }) {
@@ -18,15 +31,21 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
     const [isLoading, setIsLoading] = useState(false)
     const [attachedFiles, setAttachedFiles] = useState<File[]>([])
     const [userId, setUserId] = useState<string>("Guest")
+    const [sidebarOpen, setSidebarOpen] = useState(true)
+
+    // History State
+    const [conversations, setConversations] = useState<Conversation[]>([])
+    const [currentConversationId, setCurrentConversationId] = useState<string | null>(null)
+    const [isHistoryLoading, setIsHistoryLoading] = useState(false)
+
     const fileInputRef = useRef<HTMLInputElement>(null)
     const scrollRef = useRef<HTMLDivElement>(null)
 
+    // 1. Fetch User
     useEffect(() => {
-        // Fetch User ID from Backend
         const fetchUser = async () => {
             try {
-                // Pointing to Port 8001 where the FastAPI backend is now running with CORS enabled
-                const res = await fetch("http://localhost:8001/user")
+                const res = await fetch("http://localhost:8000/user")
                 if (res.ok) {
                     const data = await res.json()
                     setUserId(data.user_id)
@@ -38,11 +57,112 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
         fetchUser()
     }, [])
 
+    // 2. Fetch History when User is known
+    useEffect(() => {
+        if (userId === "Guest") return;
+
+        const loadHistory = async () => {
+            setIsHistoryLoading(true)
+            try {
+                const data = await getConversations(userId)
+                setConversations(data)
+            } catch (e) {
+                console.error("Failed to load history:", e)
+            } finally {
+                setIsHistoryLoading(false)
+            }
+        }
+        loadHistory()
+    }, [userId])
+
+    // Poll for title updates
+    useEffect(() => {
+        if (!currentConversationId || !userId) return;
+
+        const currentConv = conversations.find(c => c.id === currentConversationId);
+        if (currentConv?.title === "New Chat") {
+            const interval = setInterval(async () => {
+                try {
+                    // Refresh just this conversation's title? Or all...
+                    // Efficient way: fetch all history for now
+                    const updatedConvs = await getConversations(userId);
+                    setConversations(updatedConvs);
+
+                    const updated = updatedConvs.find((c: any) => c.id === currentConversationId);
+                    if (updated && updated.title !== "New Chat") {
+                        clearInterval(interval);
+                    }
+                } catch (e) {
+                    console.error("Polling error:", e);
+                }
+            }, 3000); // Check every 3s
+
+            // Stop polling after 30s to save resources
+            const timeout = setTimeout(() => clearInterval(interval), 30000);
+
+            return () => {
+                clearInterval(interval);
+                clearTimeout(timeout);
+            }
+        }
+    }, [currentConversationId, conversations, userId])
+
+
+    // Scroll to bottom
     useEffect(() => {
         if (scrollRef.current) {
             scrollRef.current.scrollTop = scrollRef.current.scrollHeight
         }
     }, [messages])
+
+    // Handlers
+    const handleNewChat = () => {
+        setCurrentConversationId(null)
+        setMessages([])
+    }
+
+    const handleSelectConversation = async (id: string) => {
+        if (id === currentConversationId) return;
+
+        setCurrentConversationId(id)
+        setIsLoading(true)
+        try {
+            const data = await getMessages(id)
+            setMessages(data.map((m: any) => ({
+                role: m.role,
+                content: m.content,
+                details: m.metadata?.step_logs,
+                grounding_metadata: m.metadata?.grounding_metadata
+            })))
+        } catch (e) {
+            console.error("Failed to load messages:", e)
+        } finally {
+            setIsLoading(false)
+        }
+    }
+
+    const handleDeleteConversation = async (id: string) => {
+        try {
+            await deleteConversation(id)
+            setConversations(prev => prev.filter(c => c.id !== id))
+            if (currentConversationId === id) {
+                handleNewChat()
+            }
+        } catch (e) {
+            console.error("Failed to delete conversation:", e)
+        }
+    }
+
+    const handleRenameConversation = async (id: string, newTitle: string) => {
+        try {
+            await updateConversationTitle(id, newTitle)
+            setConversations(prev => prev.map(c =>
+                c.id === id ? { ...c, title: newTitle } : c
+            ))
+        } catch (e) {
+            console.error("Failed to rename conversation:", e)
+        }
+    }
 
     const handleSend = async () => {
         if (!input.trim() && attachedFiles.length === 0) return
@@ -66,6 +186,19 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
         })
 
         try {
+            // Ensure conversation exists
+            let activeConvId = currentConversationId;
+            if (!activeConvId) {
+                try {
+                    const newConv = await createConversation(userId, "New Chat")
+                    activeConvId = newConv.id;
+                    setCurrentConversationId(activeConvId)
+                    setConversations(prev => [newConv, ...prev])
+                } catch (e) {
+                    console.error("Failed to create conversation:", e)
+                }
+            }
+
             const attachments = await Promise.all(attachedFiles.map(async f => ({
                 name: f.name,
                 mime_type: f.type,
@@ -74,12 +207,13 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
 
             setAttachedFiles([])
 
-            const response = await fetch("http://localhost:8001/chat", {
+            const response = await fetch("http://localhost:8000/chat", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                    message: input,
+                    message: userMessage.content,
                     user_id: userId,
+                    conversation_id: activeConvId,
                     attachments: attachments.length > 0 ? attachments : undefined
                 })
             })
@@ -89,8 +223,14 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
                 setMessages(prev => [...prev, {
                     role: "assistant",
                     content: data.response,
-                    details: data.step_logs
+                    details: data.step_logs,
+                    grounding_metadata: data.grounding_metadata
                 }])
+
+                if (activeConvId) {
+                    // Quietly refresh history to update titles/timestamps
+                    getConversations(userId).then(setConversations).catch(console.error)
+                }
             }
         } catch (error) {
             console.error("Chat error:", error)
@@ -102,32 +242,24 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
     return (
         <div className="flex h-screen w-full bg-[#050505] overflow-hidden">
             {/* Sidebar */}
-            <div className="w-80 glass-dark border-r border-white/5 p-8 flex flex-col gap-8 hidden md:flex shrink-0">
-                <div className="flex items-center gap-3">
-                    <div className="w-10 h-10 bg-white rounded-xl flex items-center justify-center shadow-lg shadow-white/5">
-                        <div className="w-5 h-5 bg-black rounded-sm" />
-                    </div>
-                    <div className="flex flex-col">
-                        <span className="text-2xl font-bold tracking-tighter text-white">Sekhmet</span>
-                        <span className="text-[10px] text-white/40 font-bold uppercase tracking-[0.2em] leading-none mt-1">Matrix: {userId}</span>
-                    </div>
-                </div>
-
-                <div className="flex flex-col gap-3 mt-10">
-                    <div className="text-[10px] uppercase tracking-[0.2em] text-white/30 font-black mb-2">Cognitive Layer</div>
-                    <button onClick={onBack} className="flex items-center gap-4 px-5 py-3 rounded-xl hover:bg-white/5 text-white/50 hover:text-white transition-all group">
-                        <Home className="w-5 h-5 group-hover:scale-110 transition-transform" />
-                        <span className="font-semibold">Exit to Terminal</span>
-                    </button>
-                    <button onClick={() => setMessages([])} className="flex items-center gap-4 px-5 py-3 rounded-xl hover:bg-white/5 text-white/50 hover:text-white transition-all group">
-                        <Trash2 className="w-5 h-5 group-hover:scale-110 transition-transform" />
-                        <span className="font-semibold">Purge Matrix</span>
-                    </button>
-                </div>
-            </div>
+            <Sidebar
+                userId={userId}
+                currentConversationId={currentConversationId}
+                onSelectConversation={handleSelectConversation}
+                onNewChat={handleNewChat}
+                conversations={conversations}
+                onDeleteConversation={handleDeleteConversation}
+                onRenameConversation={handleRenameConversation}
+                isLoading={isHistoryLoading}
+                isOpen={sidebarOpen}
+                onToggle={() => setSidebarOpen(prev => !prev)}
+            />
 
             {/* Main Chat Area */}
-            <div className="flex-1 flex flex-col relative min-w-0 bg-[#050505]">
+            <div className={cn(
+                "flex-1 flex flex-col relative min-w-0 bg-[#050505] transition-all duration-300",
+                sidebarOpen ? "md:ml-[260px]" : "md:ml-0"
+            )}>
                 {/* Header for Mobile */}
                 <div className="md:hidden p-4 glass-dark border-b border-white/5 flex items-center justify-between">
                     <span className="font-bold text-white">Sekhmet</span>
@@ -162,7 +294,7 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
                                 animate={{ opacity: 1, scale: 1 }}
                                 key={i}
                                 className={cn(
-                                    "flex flex-col gap-4 min-w-0",
+                                    "flex flex-col gap-2 min-w-0",
                                     m.role === "user" ? "items-end" : "items-start"
                                 )}
                             >
@@ -174,23 +306,18 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
                                 )}>
                                     {m.content}
                                 </div>
+
                                 {m.files && (
                                     <div className="flex items-center gap-2 px-3 py-1.5 rounded-full glass border-white/5 text-[10px] text-white/40 font-bold tracking-wider uppercase">
                                         <Paperclip className="w-3 h-3" />
                                         {m.files} Knowledge Modules Ingested
                                     </div>
                                 )}
-                                {m.details && (
-                                    <div className="w-full max-w-[95%]">
-                                        <details className="group">
-                                            <summary className="text-[10px] uppercase tracking-[0.2em] text-white/20 cursor-pointer hover:text-white/40 transition-all px-1 flex items-center gap-2 font-bold py-2">
-                                                <div className="w-1.5 h-1.5 rounded-full bg-blue-500/50 group-open:bg-blue-400 animate-pulse" />
-                                                Epistemic Intelligence Logs
-                                            </summary>
-                                            <div className="mt-4 p-5 glass rounded-2xl text-xs overflow-x-auto text-white/50 font-mono border border-white/5 leading-relaxed bg-white/[0.01]">
-                                                {JSON.stringify(m.details, null, 2)}
-                                            </div>
-                                        </details>
+
+                                {m.role === "assistant" && (
+                                    <div className="w-full max-w-[90%] md:max-w-[80%] space-y-2">
+                                        {m.grounding_metadata && <GroundingFiles metadata={m.grounding_metadata} />}
+                                        {m.details && <ThinkingProcess details={m.details} />}
                                     </div>
                                 )}
                             </motion.div>
@@ -212,8 +339,8 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
                 </div>
 
                 {/* Input Area - Floating Bar */}
-                <div className="absolute bottom-10 left-0 right-0 px-4 md:px-10 z-50">
-                    <div className="max-w-4xl mx-auto flex flex-col gap-6">
+                <div className="absolute bottom-6 left-0 right-0 px-4 md:px-8 z-50">
+                    <div className="max-w-2xl mx-auto flex flex-col gap-3">
                         {/* File Previews */}
                         <AnimatePresence>
                             {attachedFiles.length > 0 && (
@@ -221,17 +348,17 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
                                     initial={{ opacity: 0, y: 10, scale: 0.95 }}
                                     animate={{ opacity: 1, y: 0, scale: 1 }}
                                     exit={{ opacity: 0, y: 10, scale: 0.95 }}
-                                    className="flex flex-wrap gap-2 p-3 glass rounded-2xl border-white/10 shadow-2xl backdrop-blur-3xl"
+                                    className="flex flex-wrap gap-2 p-3 rounded-2xl bg-white/[0.03] border border-white/[0.08]"
                                 >
                                     {attachedFiles.map((file, i) => (
-                                        <div key={i} className="flex items-center gap-3 pl-3 pr-2 py-2 glass-dark rounded-xl border border-white/5 group bg-white/5 hover:bg-white/10 transition-colors">
-                                            <Paperclip className="w-3.5 h-3.5 text-white/40" />
-                                            <span className="text-xs text-white/70 truncate max-w-[150px] font-medium">{file.name}</span>
+                                        <div key={i} className="flex items-center gap-2 pl-3 pr-2 py-1.5 rounded-lg bg-white/5 border border-white/[0.06] group hover:bg-white/[0.08] transition-colors">
+                                            <Paperclip className="w-3 h-3 text-white/40" />
+                                            <span className="text-xs text-white/60 truncate max-w-[150px]">{file.name}</span>
                                             <button
                                                 onClick={() => setAttachedFiles(prev => prev.filter((_, idx) => idx !== i))}
-                                                className="p-1 px-1.5 rounded-lg hover:bg-white/10 text-white/20 hover:text-red-400 transition-all"
+                                                className="p-0.5 rounded hover:bg-white/10 text-white/20 hover:text-red-400 transition-all"
                                             >
-                                                <X className="w-3.5 h-3.5" />
+                                                <X className="w-3 h-3" />
                                             </button>
                                         </div>
                                     ))}
@@ -240,30 +367,38 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
                         </AnimatePresence>
 
                         {/* Input Container */}
-                        <div className="relative group glow-shadow">
-                            <div className="absolute inset-0 bg-white/5 rounded-3xl blur-2xl group-focus-within:bg-white/10 transition-all -z-10" />
+                        <div className="relative">
                             <input
                                 type="text"
                                 value={input}
                                 onChange={(e) => setInput(e.target.value)}
                                 onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-                                placeholder="Sync with Sekhmet Matrix..."
-                                className="w-full px-8 py-6 pr-40 glass-dark border border-white/20 rounded-[28px] text-white text-lg placeholder:text-white/10 outline-none focus:border-white/40 transition-all shadow-2xl backdrop-blur-3xl"
+                                placeholder={isLoading ? "Processing..." : "Message Sekhmet..."}
+                                className="w-full px-5 py-4 pr-24 bg-[#1a1a1a] border border-white/[0.08] rounded-2xl text-white text-[15px] placeholder:text-white/20 outline-none focus:border-white/20 transition-all"
                             />
-                            <div className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-3">
+                            <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1.5">
                                 <button
                                     onClick={() => fileInputRef.current?.click()}
-                                    className="p-3.5 rounded-2xl hover:bg-white/5 text-white/20 hover:text-white transition-all active:scale-90"
-                                    title="Attach Knowledge"
+                                    className="p-2 rounded-lg hover:bg-white/[0.06] text-white/25 hover:text-white/60 transition-all"
+                                    title="Attach file"
                                 >
-                                    <Paperclip className="w-6 h-6" />
+                                    <Paperclip className="w-4 h-4" />
                                 </button>
                                 <button
                                     onClick={handleSend}
-                                    disabled={isLoading}
-                                    className="p-4 bg-white text-black rounded-2xl hover:scale-110 active:scale-90 transition-all shadow-[0_0_40px_rgba(255,255,255,0.2)] disabled:opacity-50 disabled:scale-100 group"
+                                    disabled={!input.trim() && attachedFiles.length === 0}
+                                    className={cn(
+                                        "p-2 rounded-lg transition-all",
+                                        input.trim() || attachedFiles.length > 0
+                                            ? "bg-white text-black hover:bg-white/90 active:scale-95"
+                                            : "bg-white/[0.06] text-white/20 cursor-not-allowed"
+                                    )}
                                 >
-                                    <Send className="w-6 h-6 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-transform" />
+                                    {isLoading ? (
+                                        <Loader2 className="w-4 h-4 animate-spin" />
+                                    ) : (
+                                        <ArrowUp className="w-4 h-4" />
+                                    )}
                                 </button>
                             </div>
                             <input
