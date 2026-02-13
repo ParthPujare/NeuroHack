@@ -16,11 +16,17 @@ def print_warning(msg):
 def print_error(msg):
     print(f"\033[1;31m[ERROR] {msg}\033[0m")
 
-def run_command(command, cwd=None, shell=False):
+def run_command(command, cwd=None):
     try:
-        subprocess.check_call(command, cwd=cwd, shell=shell)
+        # Use shell=True if the command is a string, otherwise shell=False for list
+        is_shell = isinstance(command, str)
+        subprocess.check_call(command, cwd=cwd, shell=is_shell)
     except subprocess.CalledProcessError as e:
         print_error(f"Command failed: {command}")
+        sys.exit(1)
+    except FileNotFoundError:
+        cmd_name = command[0] if isinstance(command, list) else command.split()[0]
+        print_error(f"Command not found: {cmd_name}")
         sys.exit(1)
 
 def check_requirements():
@@ -35,9 +41,14 @@ def check_requirements():
 
     # Check Node.js
     try:
-        node_version = subprocess.check_output(["node", "-v"], text=True).strip()
-        print(f"Node.js version: {node_version}")
-    except FileNotFoundError:
+        node_version_raw = subprocess.check_output(["node", "-v"], text=True).strip()
+        print(f"Node.js version: {node_version_raw}")
+        
+        # Simple version check (v18+)
+        major_version = int(node_version_raw.lstrip('v').split('.')[0])
+        if major_version < 18:
+            print_warning("Node.js v18+ is recommended. Your version might cause issues.")
+    except (FileNotFoundError, subprocess.CalledProcessError, ValueError):
         print_error("Node.js is not installed. Please install Node.js (v18+ recommended).")
         sys.exit(1)
 
@@ -120,7 +131,7 @@ def setup_frontend():
     
     # Install dependencies
     print("Installing frontend dependencies...")
-    run_command([pkg_manager, "install"], cwd=frontend_dir, shell=True)
+    run_command([pkg_manager, "install"], cwd=frontend_dir)
     print_success("Frontend dependencies installed.")
 
 def main():
