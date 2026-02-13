@@ -502,7 +502,7 @@ export default function ChatInterface({ onBack }: { onBack: () => void }) {
                                 className="w-full px-5 py-4 pr-24 bg-[#1a1a1a] border border-white/[0.08] rounded-2xl text-white text-[15px] placeholder:text-white/20 outline-none focus:border-white/20 transition-all resize-none custom-scrollbar"
                                 style={{ minHeight: '56px', maxHeight: '200px', overflowY: 'hidden' }}
                             />
-                            <div className="absolute right-2 bottom-2 flex items-center gap-2">
+                            <div className="absolute  m-2 right-2 bottom-2 flex items-center gap-2">
                                 <button
                                     onClick={() => fileInputRef.current?.click()}
                                     className="p-2.5 rounded-xl hover:bg-white/10 text-white/40 hover:text-white transition-colors"
